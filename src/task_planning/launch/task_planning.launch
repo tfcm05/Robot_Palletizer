@@ -1,0 +1,5 @@
+<launch>
+  <node name="task_planning" pkg="task_planning" type="task_planning_node.py" output="screen">
+    <rosparam command="load" file="$(find task_planning)/config/task_planning_params.yaml" />
+  </node>
+</launch>

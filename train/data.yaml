@@ -1,0 +1,12 @@
+path: /home/tfcm/catkin_ws/datasets/
+
+train: images/train
+val: images/val
+test: images/test
+
+nc: 4
+names:
+  0: red_large
+  1: red_small
+  2: green_large
+  3: green_small

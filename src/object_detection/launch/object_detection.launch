@@ -1,0 +1,11 @@
+<launch>
+  <node name="object_detection" pkg="object_detection" type="detect_ros.py" output="screen">
+    <param name="model" value="yolo"/>
+    
+    <param name="camera_topic" value="/kinect2/qhd/image_color_rect"/>
+    <param name="depth_topic" value="/kinect2/qhd/image_depth_rect"/>
+    <param name="camera_info_topic" value="/kinect2/qhd/camera_info"/>
+    <param name="detection_topic" value="/object_detection/detections"/>
+    <param name="display" value="true"/>
+  </node>
+</launch>

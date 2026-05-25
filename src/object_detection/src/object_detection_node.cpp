@@ -131,7 +131,7 @@ public:
         getStringParamWithFallback(
             private_nh_, global_nh_, "detection_object_topic", {"detection_object_topic"}, detection_object_topic_, "/object_detection/detection_objects");
         getStringParamWithFallback(
-            private_nh_, global_nh_, "pose_frame", {"pose_frame"}, pose_frame_, "world");
+            private_nh_, global_nh_, "pose_frame", {"pose_frame"}, pose_frame_, "base_link");
 
         // 获取参数
         getParamWithFallback(private_nh_, global_nh_, "depth_window_size", "depth_window_size", depth_window_size_, 5);

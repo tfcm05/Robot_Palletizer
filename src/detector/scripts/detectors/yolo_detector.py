@@ -1,30 +1,33 @@
-from typing import List, Optional
+from typing import List
+
+import os
+import sys
 
 import numpy as np
 from ultralytics import YOLO
 
-from object_detection.detectors.base import BaseDetector, Detection
-from object_detection.config import DetectionConfig
+from detectors.base_detector import BaseDetector, Detection
 
-import os
-model_dir = os.path.join(os.path.dirname(__file__), "models")
+cur_dir = os.path.dirname(os.path.abspath(__file__))
+dets_dir = os.path.dirname(cur_dir)
+pkg_dir = os.path.dirname(dets_dir)
+model_dir = os.path.join(pkg_dir, "models")
 
 class YoloDetector(BaseDetector):
-    def __init__(self, config: DetectionConfig) -> None:
-        self._model: Optional[YOLO] = None
+    def __init__(self, model_config: dict) -> None:
+        self._model: YOLO = None
 
-        self._model_version = config.model_version
-        self._model_scale = config.model_scale
-        self._model_weight = config.model_weight
+        self._model_version = model_config.get("version", "11")
+        self._model_scale = model_config.get("scale", "n")
+        self._model_weight = model_config.get("weight", "pt")
 
         self._model_path = os.path.join(model_dir, f"yolo{self._model_version}{self._model_scale}.{self._model_weight}")
 
-        self._conf_threshold = config.conf_threshold
-        self._iou_threshold = config.iou_threshold
-        self._imgsz = config.imgsz
-        self._device = config.device
+        self._conf_threshold = model_config.get("conf_threshold", 0.25)
+        self._iou_threshold = model_config.get("iou_threshold", 0.45)
+        self._device = model_config.get("device", "cpu")
 
-        self._classes = config.classes
+        self._classes = model_config.get("classes", [0, 1, 2, 3])
 
     def load_model(self) -> None:
         self._model = YOLO(self._model_path)
@@ -39,7 +42,6 @@ class YoloDetector(BaseDetector):
             image, 
             conf=self._conf_threshold, 
             iou=self._iou_threshold,
-            imgsz=self._imgsz, 
             device=self._device,
             classes=self._classes,
             verbose=False

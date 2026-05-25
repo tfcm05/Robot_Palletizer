@@ -4,7 +4,6 @@ from typing import List, Tuple
 
 import numpy as np
 
-
 @dataclass
 class Detection:
     bbox: Tuple[int, int, int, int]

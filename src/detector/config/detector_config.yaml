@@ -1,0 +1,21 @@
+# 模型选择
+model_name: "yolo"
+model_version: "11"
+model_scale: "n"
+model_weight: "pt"
+
+# 模型参数
+confidence_threshold: 0.25
+iou_threshold: 0.45
+device: "cuda"
+classes: [0, 1, 2, 3] # 检测的类别
+
+# 订阅的话题
+image_topic: "/kinect2/hd/image_color_rect"
+
+# 发布的话题
+annotated_image_topic: "/detector/annotated_images"
+bounding_box_topic: "/detector/bounding_boxes"
+
+# 可视化
+show_window: true

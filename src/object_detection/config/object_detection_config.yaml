@@ -1,0 +1,19 @@
+# 订阅的话题
+bbox_topic: /detector/bounding_boxes
+
+depth_topic: /kinect2/sd/image_depth_rect
+depth_camera_info_topic: /kinect2/sd/depth_camera_info
+
+# 发布的话题
+detection_object_topic: /object_detection/detection_objects
+
+# 配置参数
+depth_window_size: 5
+sync_queue_size: 10
+sync_slop: 0.08
+min_depth: 0.1
+max_depth: 6.0
+
+pose_frame: "base_link" 
+
+

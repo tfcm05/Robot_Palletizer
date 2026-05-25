@@ -3,9 +3,7 @@ project(detector)
 
 find_package(catkin REQUIRED COMPONENTS
   cv_bridge
-  
   rospy
-  
   message_generation
   std_msgs
   sensor_msgs
@@ -25,9 +23,7 @@ generate_messages(
 catkin_package(
   CATKIN_DEPENDS
     cv_bridge
-
     rospy
-
     message_runtime
     std_msgs
     sensor_msgs

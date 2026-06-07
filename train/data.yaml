@@ -1,4 +1,4 @@
-path: /home/tfcm/catkin_ws/datasets/
+path: 
 
 train: images/train
 val: images/val

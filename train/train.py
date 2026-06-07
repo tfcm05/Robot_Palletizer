@@ -5,7 +5,6 @@ from pathlib import Path
 
 from ultralytics import YOLO
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a YOLO model for colored block detection."

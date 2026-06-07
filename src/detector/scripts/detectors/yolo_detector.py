@@ -54,15 +54,16 @@ class YoloDetector(BaseDetector):
                 continue
             for i in range(len(boxes)):
                 x1, y1, x2, y2 = map(int, boxes.xyxy[i].tolist())
+                # 确保 x1 < x2 且 y1 < y2
+                x1, x2 = min(x1, x2), max(x1, x2)
+                y1, y2 = min(y1, y2), max(y1, y2)
                 confidence = float(boxes.conf[i])
                 class_id = int(boxes.cls[i])
-                class_name = result.names[class_id] if result.names else str(class_id)
                 detections.append(
                     Detection(
                         bbox=(x1, y1, x2, y2),
                         confidence=confidence,
-                        class_id=class_id,
-                        class_name=class_name,
+                        class_id=class_id
                     )
                 )
 

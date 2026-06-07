@@ -19,3 +19,6 @@ bounding_box_topic: "/detector/bounding_boxes"
 
 # 可视化
 show_window: true
+
+# 处理频率限制
+min_interval: 0.033 # 最小处理间隔，单位秒，对应于最大帧率约30 FPS

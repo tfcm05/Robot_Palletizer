@@ -1,0 +1,15 @@
+# 任务列表数量上限
+max_task_count: 3
+# 策略
+planning_strategy: "nearest_first"  # nearest_first, custom_logic
+
+# 循环频率（Hz）
+loop_rate: 10
+
+# 订阅话题
+detection_topic: /object_detection/detected_objects
+task_result_topic: /motion_control/task_result
+info_topic: /ctrl/info
+
+# 发布话题
+command_topic: /task_planning/task_command

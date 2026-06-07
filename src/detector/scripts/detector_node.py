@@ -39,6 +39,9 @@ class DetectorNode:
         self._bounding_box_topic = rospy.get_param("~bounding_box_topic", "/detector/bounding_boxes")
         self._show_window = rospy.get_param("~show_window", True)
 
+        self._min_interval = rospy.get_param("~min_interval", 0.033)
+        self._last_process_time = rospy.Time(0)
+
         self._bridge = CvBridge()
 
         self._engine: BaseDetector = self._create_engine(model_name)
@@ -97,7 +100,7 @@ class DetectorNode:
         for detection in detections:
             x_min, y_min, x_max, y_max = detection.bbox
             cv2.rectangle(annotated_image, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-            label = f"{detection.class_name} {detection.confidence:.2f}"
+            label = f"{detection.class_id} {detection.confidence:.2f}"
             label_origin = (x_min, max(0, y_min - 8))
             cv2.putText(
                 annotated_image,
@@ -112,6 +115,12 @@ class DetectorNode:
         return annotated_image
 
     def _image_callback(self, image_msg: Image) -> None:
+        # 限制处理频率，避免过高的帧率导致系统过载
+        now = rospy.Time.now()
+        if now - self._last_process_time < self._min_interval:
+            return
+        self._last_process_time = now
+
         try:
             cv_image = self._bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
         except CvBridgeError as error:

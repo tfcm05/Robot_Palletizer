@@ -28,8 +28,8 @@ int32 total_count                 # 总任务数
 | 话题 | 消息类型 | 来源 | 说明 |
 |---|---|---|---|
 | `/object_detection/detected_objects` | `object_detection/DetectionObjects` | object_detection | 检测到的物体列表 |
-| `/motion_control/task_result` | `motion_control/TaskResult` | motion_control | 任务执行结果回执 |
-| `/robot_core/msg/info` | `robot_core/Info` | robot_core | 机器人状态信息（可选） |
+| `/motion_control/task_result` | `task_planning/TaskResult` | motion_control | 任务执行结果回执 |
+| `/ctrl/info` | `robot_core/msg/Info` | robot_core | 机器人状态信息 |
 
 ## 4. 配置参数 (config/task_planning_config.yaml)
 
@@ -44,7 +44,7 @@ loop_rate: 10
 # 订阅话题
 detection_topic: /object_detection/detected_objects
 task_result_topic: /motion_control/task_result
-robot_info_topic: /robot_core/msg/info
+robot_info_topic: /ctrl/info
 
 # 发布话题
 command_topic: /task_planning/task_command
@@ -94,8 +94,7 @@ task_planning                          motion_control
     ├─ TaskCommand(task_idx=3) ──────→      │  (跳过出错，继续下一个)
     │←────── TaskResult(completed) ─────┤   │
     │                                       │
-    
-    │←────── TaskResult(completed) ─────┤   │
+
 ```
 
 ## 6. 模块目录结构

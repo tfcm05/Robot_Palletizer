@@ -4,3 +4,4 @@ int64 x_max
 int64 y_max
 
 int32 class_id
+float32 confidence

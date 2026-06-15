@@ -1,53 +1,61 @@
-#include <cmath>
 #include <algorithm>
+#include <cmath>
 #include <string>
+#include <vector>
 
 #include <ros/ros.h>
-#include <std_msgs/Header.h>
-#include <geometry_msgs/Pose.h>
-#include <robot_core/Info.h>
-#include <object_detection/DetectionObjects.h>
-#include <object_detection/DetectionObject.h>
-#include <task_planning/TaskCommand.h>
-#include <task_planning/TaskResult.h>
 
+#include <geometry_msgs/PoseStamped.h>
+#include <motion_control/SubTaskResult.h>
+#include <object_detection/DetectionObject.h>
+#include <object_detection/DetectionObjects.h>
+#include <robot_core/Info.h>
+#include <task_planning/SubTask.h>
+#include <task_planning/Task.h>
+
+/**
+ * @class TaskPlanningNode
+ * @brief 任务规划节点
+ *
+ * 作为高层决策层，负责接收检测结果，逐个规划子任务并发布给 motion_control 执行。
+ * 采用三阶段状态机：准备（IDLE） -> 规划执行（PLANNING / WAITING_RESULT） -> 结束（FIN）。
+ */
 class TaskPlanningNode {
 public:
-    TaskPlanningNode() :
-        nh_(),
-        rate_(10.0)
-    {
-        // 最大任务数量
-        nh_.param<int>("max_task_count", max_task_count_, 3);
-        // 规划策略参数
-        nh_.param<std::string>("planning_strategy", planning_strategy_, "nearest_first");
-
-        // 循环频率参数
-        nh_.param<double>("loop_rate", loop_rate_, 10.0);
-
-        // 获取话题名称参数
-        std::string detection_topic, task_result_topic, info_topic, command_topic;
-        // 订阅话题参数
-        nh_.param<std::string>("detection_topic", detection_topic, "/object_detection/detected_objects");
-        nh_.param<std::string>("task_result_topic", task_result_topic, "/motion_control/task_result");
-        nh_.param<std::string>("info_topic", info_topic, "/ctrl/info");
-        // 发布话题参数
-        nh_.param<std::string>("command_topic", command_topic, "/task_planning/task_command");
-
-        // 初始化订阅者
-        detection_sub_ = nh_.subscribe(detection_topic, 5, &TaskPlanningNode::detectionCallback, this);
-        task_result_sub_ = nh_.subscribe(task_result_topic, 5, &TaskPlanningNode::taskResultCallback, this);
-        info_sub_ = nh_.subscribe(info_topic, 5, &TaskPlanningNode::infoCallback, this);
-
-        // 初始化发布者
-        command_pub_ = nh_.advertise<task_planning::TaskCommand>(command_topic, 1);
-
-        rate_ = ros::Rate(loop_rate_);
-
-        ROS_INFO("TaskPlanningNode initialized. Strategy: %s, Max tasks: %d, Rate: %.1f Hz",
-                 planning_strategy_.c_str(), max_task_count_, loop_rate_);
+    /**
+     * @brief 构造函数：加载参数、初始化 ROS 订阅者与发布者
+     */
+    TaskPlanningNode()
+        // ROS 节点句柄
+        : private_nh_("~")   ///< 私有节点句柄，用于读取参数
+        , public_nh_()       ///< 公共节点句柄，用于订阅和发布话题
+        // 配置参数
+        , rate_(ros::Rate(private_nh_.param("loop_rate", 10.0)))          ///< 主循环频率
+        , max_sub_task_count_(private_nh_.param("max_sub_task_count", 3)) ///< 单轮任务中成功子任务数量上限
+        , planning_strategy_(private_nh_.param("planning_strategy", std::string("nearest_first"))) ///< 规划策略
+        , loop_rate_(private_nh_.param("loop_rate", 10.0))                ///< 主循环频率（Hz）
+        // ROS 订阅者
+        , info_sub_(public_nh_.subscribe(
+              private_nh_.param("info_topic", std::string("/ctrl/info")), 5,
+              &TaskPlanningNode::infoCallback, this))   ///< 机器人状态信息订阅者
+        , detection_sub_(public_nh_.subscribe(
+              private_nh_.param("detection_topic", std::string("/object_detection/detected_objects")), 5,
+              &TaskPlanningNode::detectionCallback, this))   ///< 检测结果订阅者
+        , sub_task_result_sub_(public_nh_.subscribe(
+              private_nh_.param("sub_task_result_topic", std::string("/motion_control/sub_task_result")), 5,
+              &TaskPlanningNode::subTaskResultCallback, this))   ///< 子任务执行结果订阅者
+        // ROS 发布者
+        , task_pub_(public_nh_.advertise<task_planning::Task>(
+              private_nh_.param("task_topic", std::string("/task_planning/task")), 1))   ///< 任务指令发布者
+        , sub_task_pub_(public_nh_.advertise<task_planning::SubTask>(
+              private_nh_.param("sub_task_topic", std::string("/task_planning/sub_task")), 1)) { ///< 子任务指令发布者
+        ROS_INFO("TaskPlanningNode initialized. Strategy: %s, Max sub-tasks: %d, Rate: %.1f Hz",
+                 planning_strategy_.c_str(), max_sub_task_count_, loop_rate_);
     }
 
+    /**
+     * @brief 主循环：根据当前状态调用对应的状态处理函数
+     */
     void run() {
         while (ros::ok()) {
             ros::spinOnce();
@@ -62,8 +70,11 @@ public:
                 case WAITING_RESULT:
                     handleWaitingResult();
                     break;
-                case DONE:
-                    handleDone();
+                case FIN:
+                    handleFin();
+                    break;
+                default:
+                    ROS_ERROR("Unknown state!");
                     break;
             }
 
@@ -72,53 +83,82 @@ public:
     }
 
 private:
-    enum State { IDLE, PLANNING, WAITING_RESULT, DONE, FIN };
+    /**
+     * @brief 状态枚举
+     *
+     * IDLE：准备阶段，等待触发信号
+     * PLANNING：规划阶段，订阅检测结果并发布子任务
+     * WAITING_RESULT：等待子任务执行结果
+     * FIN：结束阶段，发布任务完成信息
+     */
+    enum State { IDLE, PLANNING, WAITING_RESULT, FIN };
 
     // ROS 节点句柄
-    ros::NodeHandle nh_;
-
-    // 订阅者和发布者
-    ros::Subscriber detection_sub_;
-    ros::Subscriber task_result_sub_;
-    ros::Subscriber info_sub_;
-    ros::Publisher command_pub_;
+    ros::NodeHandle private_nh_;
+    ros::NodeHandle public_nh_;
 
     // 循环频率控制器
     ros::Rate rate_;
 
-    // 当前状态
-    State state_ = IDLE; // 初始状态为 IDLE
-
     // 配置参数
-    int max_task_count_;
-    double loop_rate_;
-    std::string planning_strategy_;
+    const int max_sub_task_count_;               ///< 单轮任务中成功子任务数量上限
+    const std::string planning_strategy_;        ///< 规划策略
+    const double loop_rate_;                     ///< 主循环频率（Hz）
 
-    // 任务执行状态
-    int task_index_ = 0;
-    int task_completed_count_ = 0;
-    bool triggered_ = false;
+    // ROS 订阅者
+    ros::Subscriber info_sub_;            ///< 机器人状态信息订阅者
+    ros::Subscriber detection_sub_;       ///< 检测结果订阅者
+    ros::Subscriber sub_task_result_sub_; ///< 子任务执行结果订阅者
 
+    // ROS 发布者
+    ros::Publisher task_pub_;    ///< 任务指令发布者
+    ros::Publisher sub_task_pub_; ///< 子任务指令发布者
+
+    // 当前状态
+    State state_ = IDLE;
+
+    // 任务相关索引
+    int task_index_ = 0;     ///< 当前任务编号
+    int sub_task_index_ = 0; ///< 下一个待发布子任务的编号
+
+    // 子任务执行结果记录
+    std::vector<int32_t> sub_task_indices_completed_; ///< 成功完成的子任务编号列表
+    std::vector<int32_t> sub_task_indices_failed_;    ///< 执行失败的子任务编号列表
+
+    // 数据接收标志与缓存
     bool got_detection_ = false;
-    object_detection::DetectionObjects::ConstPtr latest_detection_ = nullptr;
+    object_detection::DetectionObjects::ConstPtr latest_detection_; ///< 最新检测结果
 
     bool got_result_ = false;
-    task_planning::TaskResult::ConstPtr latest_result_ = nullptr;
+    motion_control::SubTaskResult::ConstPtr latest_result_; ///< 最新子任务执行结果
 
-    // 物体识别回调函数，接收检测结果并存储
-    void detectionCallback(const object_detection::DetectionObjects::ConstPtr& msg) {
+    bool triggered_ = false; ///< 是否收到任务触发信号
+
+    /**
+     * @brief 检测结果回调函数
+     * @param msg 检测到的物体列表
+     */
+    void detectionCallback(const object_detection::DetectionObjects::ConstPtr &msg) {
         latest_detection_ = msg;
         got_detection_ = true;
     }
 
-    // 任务结果回调函数，接收执行结果并存储
-    void taskResultCallback(const task_planning::TaskResult::ConstPtr& msg) {
+    /**
+     * @brief 子任务执行结果回调函数
+     * @param msg 子任务执行结果
+     */
+    void subTaskResultCallback(const motion_control::SubTaskResult::ConstPtr &msg) {
         latest_result_ = msg;
         got_result_ = true;
     }
 
-    // 机器人状态回调函数，接收状态信息并根据规划触发条件更新状态
-    void infoCallback(const robot_core::Info::ConstPtr& msg) {
+    /**
+     * @brief 机器人状态信息回调函数
+     * @param msg 机器人状态信息
+     *
+     * 当机器人处于 TASK_SCHEDULE 模式时，若当前为 IDLE 状态，则触发任务规划。
+     */
+    void infoCallback(const robot_core::Info::ConstPtr &msg) {
         if (msg->mode == robot_core::Info::TASK_SCHEDULE) {
             if (state_ == IDLE) {
                 triggered_ = true;
@@ -127,99 +167,172 @@ private:
         }
     }
 
-    // 状态处理函数
+    /**
+     * @brief IDLE 状态处理函数
+     *
+     * 等待触发信号，收到后进入 PLANNING 状态。
+     */
     void handleIdle() {
-        // 在IDLE状态下等待触发信号，触发后进入PLANNING状态
         if (triggered_) {
             state_ = PLANNING;
             ROS_INFO("State: IDLE -> PLANNING");
         }
     }
 
+    /**
+     * @brief PLANNING 状态处理函数
+     *
+     * 1. 等待一次检测结果；
+     * 2. 若场景中无物体，进入 FIN 状态；
+     * 3. 否则按策略选择目标物体，发布 SubTask，进入 WAITING_RESULT 状态。
+     */
     void handlePlanning() {
         if (!got_detection_ || !latest_detection_) {
-            // 如果没有收到检测数据，则保持在PLANNING状态，等待数据到来
             ROS_INFO_THROTTLE(5.0, "PLANNING: Waiting for detection data...");
             return;
         }
 
-        // 如果没有检测到任何物体，则直接进入 FIN 状态
+        // 场景中无物体，结束本轮任务
         if (latest_detection_->objects.empty()) {
             ROS_WARN("PLANNING: No objects detected. Going to FIN.");
+            got_detection_ = false;
             state_ = FIN;
             return;
         }
 
-        auto object = selectTargetObject(latest_detection_);
+        // 按规划策略选择目标物体
+        const auto &obj = selectTargetObject(latest_detection_);
 
-        // 根据规划策略选择下一个目标物体，并发布 TaskCommand 消息
-        const auto& obj = object;
+        // 构造并发布子任务
+        task_planning::SubTask sub_task;
+        sub_task.target_class_id = obj.class_id;
+        sub_task.target_pose = obj.pose;
+        sub_task.sub_task_index = sub_task_index_;
 
-        task_planning::TaskCommand cmd;
-        cmd.target_class_id = obj.class_id;
-        cmd.target_pose = obj.pose;
-        cmd.task_index = task_index_;
+        sub_task_pub_.publish(sub_task);
+        ROS_INFO("Published SubTask: class_id=%d, index=%d",
+                 sub_task.target_class_id, sub_task.sub_task_index);
 
-        command_pub_.publish(cmd);
-        ROS_INFO("Published TaskCommand: class_id=%d, index=%d",
-                 cmd.target_class_id, cmd.task_index);
-
-        got_detection_ = false; // 重置检测标志，等待下一轮检测数据
+        sub_task_index_++;
+        got_detection_ = false;
         state_ = WAITING_RESULT;
     }
 
+    /**
+     * @brief WAITING_RESULT 状态处理函数
+     *
+     * 等待子任务执行结果回执：
+     * - 成功：记录到完成列表；若成功数量达到上限则进入 FIN，否则回到 PLANNING 继续规划下一个子任务。
+     * - 失败：记录到失败列表，跳过当前任务，回到 PLANNING 继续规划下一个子任务。
+     */
     void handleWaitingResult() {
-        // 如果没有收到任务执行结果，则保持在 WAITING_RESULT 状态，等待结果到来
         if (!got_result_ || !latest_result_) {
+            ROS_INFO_THROTTLE(5.0, "WAITING_RESULT: Waiting for sub-task result...");
             return;
         }
 
-        const auto& result = *latest_result_;
+        got_result_ = false;
 
-        if (result.status == task_planning::TaskResult::SUCCESS) {
-            ROS_INFO("Task %d succeeded: %s", task_index_, result.message.c_str());
-            task_index_++;
-            task_completed_count_++;
-            if (task_completed_count_ == max_task_count_) {
-                ROS_INFO("Reached max task count (%d). Going to DONE.", max_task_count_);
-                state_ = DONE;
+        if (latest_result_->result == motion_control::SubTaskResult::SUCCESS) {
+            sub_task_indices_completed_.push_back(latest_result_->task_index);
+            ROS_INFO("SubTask %d succeeded", latest_result_->task_index);
+
+            // 成功子任务数量达到上限，结束本轮任务
+            if (static_cast<int>(sub_task_indices_completed_.size()) >= max_sub_task_count_) {
+                ROS_INFO("Reached max sub-task count (%d). Going to FIN.", max_sub_task_count_);
+                got_detection_ = false;
+                state_ = FIN;
             } else {
                 state_ = PLANNING;
             }
         } else {
-            ROS_ERROR("Task %d failed: %s. Going to DONE.", task_index_, result.message.c_str());
-            task_index_++;
-            state_ = DONE;
+            sub_task_indices_failed_.push_back(latest_result_->task_index);
+            ROS_ERROR("SubTask %d failed. Skipping to next.", latest_result_->task_index);
+            state_ = PLANNING;
         }
-
-        got_result_ = false; // 重置结果标志，等待下一轮结果数据
     }
 
-    void handleDone() {
-        ROS_INFO("Task planning cycle completed. %d tasks processed. Returning to IDLE.", task_completed_count_);
+    /**
+     * @brief FIN 状态处理函数
+     *
+     * 再次订阅一次检测结果，判断任务是否真正结束：
+     * - 若场景中无剩余物体，发布 is_finish=true 的 Task 消息，进入 IDLE。
+     * - 若场景中仍有物体，发布 is_finish=false 的 Task 消息，进入 IDLE 等待下一轮触发。
+     */
+    void handleFin() {
+        if (!got_detection_ || !latest_detection_) {
+            ROS_INFO_THROTTLE(5.0, "FIN: Waiting for detection data...");
+            return;
+        }
+
+        // 构造并发布任务指令
+        task_planning::Task task;
+        task.task_index = task_index_;
+        task.sub_task_count = static_cast<int32_t>(sub_task_indices_completed_.size() + sub_task_indices_failed_.size());
+        task.sub_task_indices_completed = sub_task_indices_completed_;
+        task.sub_task_indices_failed = sub_task_indices_failed_;
+
+        if (latest_detection_->objects.empty()) {
+            task.is_finish = true;
+            ROS_INFO("No objects remaining. Task finished (is_finish=true).");
+        } else {
+            task.is_finish = false;
+            ROS_INFO("Objects still remaining. Task cycle done but more work to do (is_finish=false).");
+        }
+
+        task_pub_.publish(task);
+        ROS_INFO("Published Task: task_index=%d, sub_task_count=%d, completed=%d, failed=%d, is_finish=%s",
+                 task.task_index, task.sub_task_count,
+                 static_cast<int>(sub_task_indices_completed_.size()),
+                 static_cast<int>(sub_task_indices_failed_.size()),
+                 task.is_finish ? "true" : "false");
+
+        resetState();
+    }
+
+    /**
+     * @brief 重置任务状态与计数器
+     *
+     * 回到 IDLE，清空本轮任务数据，任务编号递增，准备下一轮任务规划。
+     */
+    void resetState() {
         state_ = IDLE;
         triggered_ = false;
-        task_index_ = 0;
-        task_completed_count_ = 0;
         got_detection_ = false;
         got_result_ = false;
         latest_detection_ = nullptr;
         latest_result_ = nullptr;
+        sub_task_index_ = 0;
+        sub_task_indices_completed_.clear();
+        sub_task_indices_failed_.clear();
+        task_index_++;
     }
 
-    double calculateDistance(const geometry_msgs::Pose& pose) {
-        double dx = pose.position.x;
-        double dy = pose.position.y;
-        double dz = pose.position.z;
+    /**
+     * @brief 计算物体位姿到原点的欧氏距离
+     * @param pose 物体位姿
+     * @return 欧氏距离
+     */
+    double calculateDistance(const geometry_msgs::PoseStamped &pose) {
+        double dx = pose.pose.position.x;
+        double dy = pose.pose.position.y;
+        double dz = pose.pose.position.z;
         return std::sqrt(dx * dx + dy * dy + dz * dz);
     }
 
-    DetectionObject selectTargetObject(const object_detection::DetectionObjects::ConstPtr& detection) {
+    /**
+     * @brief 根据规划策略从检测结果中选择目标物体
+     * @param detection 检测结果
+     * @return 被选中的目标物体
+     *
+     * - nearest_first：选择距离原点最近的物体。
+     * - 其他策略：当前默认返回第一个检测到的物体，可后续扩展。
+     */
+    object_detection::DetectionObject selectTargetObject(const object_detection::DetectionObjects::ConstPtr &detection) {
         if (planning_strategy_ == "nearest_first") {
-            // 最近优先策略：选择距离最近的物体作为目标
-            double min_distance = 10.0; // 设置一个较大的初始距离阈值
-            DetectionObject nearest_obj;
-            for (const auto& obj : detection->objects) {
+            double min_distance = 10.0;
+            object_detection::DetectionObject nearest_obj;
+            for (const auto &obj : detection->objects) {
                 double distance = calculateDistance(obj.pose);
                 if (distance < min_distance) {
                     min_distance = distance;
@@ -228,14 +341,18 @@ private:
             }
             return nearest_obj;
         } else {
-            // 其他策略（如 custom_logic）可以在这里实现
-            // 目前默认返回第一个检测到的物体
             return detection->objects.front();
         }
     }
 };
 
-int main(int argc, char** argv) {
+/**
+ * @brief 主函数
+ * @param argc 参数个数
+ * @param argv 参数列表
+ * @return 程序退出码
+ */
+int main(int argc, char **argv) {
     ros::init(argc, argv, "task_planning_node");
     TaskPlanningNode node;
     node.run();

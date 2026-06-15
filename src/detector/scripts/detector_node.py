@@ -89,10 +89,9 @@ class DetectorNode:
             bounding_box.x_max = x_max
             bounding_box.y_max = y_max
             bounding_box.class_id = detection.class_id
+            bounding_box.confidence = detection.confidence
             bounding_boxes.bounding_boxes.append(bounding_box)
 
-        bounding_boxes.width = image_msg.width
-        bounding_boxes.height = image_msg.height
         self._bounding_box_pub.publish(bounding_boxes)
 
     def _draw(self, image: np.ndarray, detections: List[Detection]) -> np.ndarray:
@@ -117,7 +116,7 @@ class DetectorNode:
     def _image_callback(self, image_msg: Image) -> None:
         # 限制处理频率，避免过高的帧率导致系统过载
         now = rospy.Time.now()
-        if now - self._last_process_time < self._min_interval:
+        if (now - self._last_process_time).to_sec() < self._min_interval:
             return
         self._last_process_time = now
 

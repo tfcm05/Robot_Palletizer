@@ -50,7 +50,7 @@ catkin_package(
 include_directories(
 	${catkin_INCLUDE_DIRS}
 	${OpenCV_INCLUDE_DIRS}
-  ${PCL_INCLUDE_DIRS}
+    ${PCL_INCLUDE_DIRS}
 )
 
 add_executable(object_detection_node
@@ -67,7 +67,7 @@ add_compile_options(-std=c++17)
 target_link_libraries(object_detection_node
 	${catkin_LIBRARIES}
 	${OpenCV_LIBS}
-  ${PCL_LIBRARIES}
+    ${PCL_LIBRARIES}
 )
 
 install(TARGETS object_detection_node

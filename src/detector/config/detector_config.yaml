@@ -5,13 +5,13 @@ model_scale: "n"
 model_weight: "pt"
 
 # 模型参数
-confidence_threshold: 0.25
-iou_threshold: 0.45
+confidence_threshold: 0.25 # 置信度阈值，用于过滤低置信度的检测结果
+iou_threshold: 0.45 # 非极大值抑制（NMS）的IoU阈值，用于过滤重叠的检测框
 device: "cuda"
 classes: [0, 1, 2, 3] # 检测的类别
 
 # 订阅的话题
-image_topic: "/kinect2/hd/image_color_rect"
+image_topic: "/kinect2/qhd/image_color_rect"
 
 # 发布的话题
 annotated_image_topic: "/detector/annotated_images"

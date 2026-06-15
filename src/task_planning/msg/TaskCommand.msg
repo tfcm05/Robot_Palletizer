@@ -1,3 +1,0 @@
-int32 target_class_id
-geometry_msgs/Pose target_pose
-int32 task_index

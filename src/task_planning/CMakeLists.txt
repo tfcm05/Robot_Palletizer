@@ -5,15 +5,14 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   std_msgs
   geometry_msgs
-  robot_core
   object_detection
   message_generation
 )
 
 add_message_files(
   FILES
-  TaskCommand.msg
-  TaskResult.msg
+  Task.msg
+  SubTask.msg
 )
 
 generate_messages(
@@ -27,7 +26,6 @@ catkin_package(
     roscpp
     std_msgs
     geometry_msgs
-    robot_core
     object_detection
     message_runtime
 )

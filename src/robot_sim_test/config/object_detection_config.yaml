@@ -1,0 +1,26 @@
+# 订阅的话题
+bbox_topic: /detector/bounding_boxes
+depth_topic: /kinect2/qhd_depth/image_depth_rect
+camera_info_topic: /kinect2/qhd/camera_info
+# 发布的话题
+object_detection_topic: /object_detection/detected_objects
+
+# 同步参数（message_filters 时间同步）
+sync_queue_size: 10 # 同步队列大小
+sync_slop: 0.08 # 同步容忍时间（秒）
+
+# TF 参数
+tf_cache_time: 10.0 # TF 监听器缓存时间（秒）
+
+# 深度过滤参数
+min_depth: 0.1 # 有效最小深度值（米）
+max_depth: 5.0 # 有效最大深度值（米）
+depth_tolerance: 0.08 # 深度一致性容差（米）
+center_sample_ratio: 0.2 # 中心采样窗口占 ROI 的比例（0~1）
+
+# 尺寸推断参数
+size_confidence_threshold: 0.6 # 尺寸推断置信度阈值，低于此值用点云 extent 推断边长
+
+# 输出参数
+pose_frame: "base_link"  # 目标物体位姿的坐标系
+publish_point_cloud: false # 是否发布点云

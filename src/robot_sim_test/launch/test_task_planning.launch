@@ -1,0 +1,23 @@
+<launch>
+
+  <arg name="gui" default="true" doc="Launch Gazebo GUI (gzclient)"/>
+  <arg name="paused" default="false" doc="Start Gazebo paused"/>
+  <arg name="auto_trigger" default="true" doc="Automatically send TASK_SCHEDULE after startup"/>
+
+  <include file="$(find robot_sim_test)/launch/test_object_detection.launch">
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="paused" value="$(arg paused)"/>
+  </include>
+
+  <!-- Task planning node -->
+  <node name="task_planning" pkg="task_planning" type="task_planning_node" output="screen">
+    <rosparam command="load" file="$(find robot_sim_test)/config/task_planning_config.yaml"/>
+  </node>
+
+  <!-- Mock grasp executor (substitutes motion_control) -->
+  <node name="mock_grasp_executor" pkg="robot_sim_test" type="mock_grasp_executor.py" output="screen"/>
+
+  <!-- Trigger TASK_SCHEDULE after nodes are ready -->
+  <node name="trigger_schedule" pkg="robot_sim_test" type="trigger_schedule.py" output="screen" if="$(arg auto_trigger)"/>
+
+</launch>

@@ -1,12 +1,11 @@
-path: 
+# YOLO11 dataset configuration
+path: /home/tfcm/catkin_ws/train/dataset
+train: images
+val: images
 
-train: images/train
-val: images/val
-test: images/test
-
-nc: 4
+# class names
 names:
-  0: red_large
-  1: red_small
-  2: green_large
-  3: green_small
+  0: green_large
+  1: green_small
+  2: red_large
+  3: red_small

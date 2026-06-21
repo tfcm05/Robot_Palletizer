@@ -2,26 +2,25 @@
 bbox_topic: /detector/bounding_boxes
 depth_topic: /kinect2/qhd/image_depth_rect
 camera_info_topic: /kinect2/qhd/camera_info
-
 # 发布的话题
 object_detection_topic: /object_detection/detected_objects
 
-# 配置参数
-sync_queue_size: 10 # 同步队列大小，用于消息同步
-tf_cache_time: 10.0 # TF 监听器缓存时间（秒），用于坐标变换
+# 同步参数（message_filters 时间同步）
+sync_queue_size: 10 # 同步队列大小
+sync_slop: 0.08 # 同步容忍时间（秒）
 
-sync_slop: 0.08 # 同步容忍时间（秒），用于消息同步
+# TF 参数
+tf_cache_time: 10.0 # TF 监听器缓存时间（秒）
 
-min_depth: 0.1 # 最小深度值（米），用于过滤无效的深度数据
-max_depth: 6.0 # 最大深度值（米），用于过滤无效的深度数据
-depth_tolerance: 0.10 # 前景过滤深度容差（米），用于剔除 bbox 前景中过远的异常点
+# 深度过滤参数
+min_depth: 0.1 # 有效最小深度值（米）
+max_depth: 5.0 # 有效最大深度值（米）
+depth_tolerance: 0.08 # 深度一致性容差（米）
+center_sample_ratio: 0.2 # 中心采样窗口占 ROI 的比例（0~1）
 
-confidence_threshold: 0.5 # 低于该置信度阈值时，使用点云形状后处理修正类别
-large_object_diagonal_threshold: 0.18 # 点云包围盒对角线阈值
-min_points_for_shape: 30 # 参与形状判断的最少点数
+# 尺寸推断参数
+size_confidence_threshold: 0.6 # 尺寸推断置信度阈值，低于此值用点云 extent 推断边长
 
-# 坐标系
+# 输出参数
 pose_frame: "base_link"  # 目标物体位姿的坐标系
-
-# 是否发布点云
-publish_point_cloud: false
+publish_point_cloud: false # 是否发布点云

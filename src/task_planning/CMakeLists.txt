@@ -6,13 +6,15 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
   geometry_msgs
   object_detection
+  robot_core
   message_generation
 )
 
 add_message_files(
   FILES
-  Task.msg
-  SubTask.msg
+  GraspCommand.msg
+  GraspResult.msg
+  PhaseResult.msg
 )
 
 generate_messages(
@@ -27,6 +29,7 @@ catkin_package(
     std_msgs
     geometry_msgs
     object_detection
+    robot_core
     message_runtime
 )
 

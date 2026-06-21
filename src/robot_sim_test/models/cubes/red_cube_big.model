@@ -1,0 +1,54 @@
+<?xml version="1.0"?>
+<robot name="red_cube_big">
+<!-- base -->
+<link name="base_link">
+<visual>
+  <geometry>
+    <box size="0.001 0.001 0.001" />
+  </geometry>
+  <origin rpy="0 0 0" xyz="0 0 0"/>
+</visual>
+</link>
+
+  <!-- body (0.15m cube, class_id=0) -->
+  <link name="body_link">
+    <visual>
+      <geometry>
+        <box size="0.15 0.15 0.15"/>
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0.075"/>
+    </visual>
+    <collision>
+      <origin xyz="0.0 0.0 0.075" rpy="0 0 0" />
+      <geometry>
+        <box size="0.15 0.15 0.15"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="1"/>
+      <inertia ixx="0.00375" ixy="0.0" ixz="0.0" iyy="0.00375" iyz="0.0" izz="0.00375"/>
+    </inertial>
+  </link>
+  <joint name="base_to_body" type="fixed">
+    <parent link="base_link"/>
+    <child link="body_link"/>
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+  </joint>
+
+<gazebo reference="body_link">
+  <material>Gazebo/Red</material>
+</gazebo>
+
+<!-- Gazebo plugin for move -->
+<gazebo>
+  <plugin name="red_cube_big_controller" filename="libgazebo_ros_planar_move.so">
+    <commandTopic>red_cube_big_vel</commandTopic>
+    <odometryTopic>red_cube_big_odom</odometryTopic>
+    <odometryFrame>red_cube_big_odom</odometryFrame>
+    <odometryRate>0.0</odometryRate>
+    <robotBaseFrame>base_link</robotBaseFrame>
+    <broadcastTF>false</broadcastTF>
+  </plugin>
+</gazebo>
+
+</robot>

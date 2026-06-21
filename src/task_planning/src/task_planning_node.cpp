@@ -1,24 +1,34 @@
 #include <algorithm>
 #include <cmath>
+#include <set>
 #include <string>
 #include <vector>
 
 #include <ros/ros.h>
 
 #include <geometry_msgs/PoseStamped.h>
-#include <motion_control/SubTaskResult.h>
 #include <object_detection/DetectionObject.h>
 #include <object_detection/DetectionObjects.h>
 #include <robot_core/Info.h>
-#include <task_planning/SubTask.h>
-#include <task_planning/Task.h>
+#include <task_planning/GraspCommand.h>
+#include <task_planning/GraspResult.h>
+#include <task_planning/PhaseResult.h>
 
 /**
  * @class TaskPlanningNode
- * @brief 任务规划节点
+ * @brief 任务规划节点（含抓取重试状态机）
  *
- * 作为高层决策层，负责接收检测结果，逐个规划子任务并发布给 motion_control 执行。
- * 采用三阶段状态机：准备（IDLE） -> 规划执行（PLANNING / WAITING_RESULT） -> 结束（FIN）。
+ * 作为高层决策层，接收检测结果，逐个规划抓取目标并发布 GraspCommand 给 motion_control 执行。
+ * 抓取失败时自动重试，重试耗尽后标记该 track_id 为失败并跳过。
+ *
+ * 状态机：
+ *   IDLE ──(TASK_SCHEDULE 触发)──> PLANNING
+ *   PLANNING ──(无物体 / 全部失败)──> FIN
+ *   PLANNING ──(发布 GraspCommand)──> WAITING
+ *   WAITING ──(成功)──> PLANNING
+ *   WAITING ──(失败, retry < max)──> WAITING（重发同一目标）
+ *   WAITING ──(失败, retry >= max)──> PLANNING（标记 track_id 失败）
+ *   FIN ──(发布 PhaseResult)──> IDLE（resetState）
  */
 class TaskPlanningNode {
 public:
@@ -26,31 +36,29 @@ public:
      * @brief 构造函数：加载参数、初始化 ROS 订阅者与发布者
      */
     TaskPlanningNode()
-        // ROS 节点句柄
         : private_nh_("~")   ///< 私有节点句柄，用于读取参数
         , public_nh_()       ///< 公共节点句柄，用于订阅和发布话题
-        // 配置参数
         , rate_(ros::Rate(private_nh_.param("loop_rate", 10.0)))          ///< 主循环频率
-        , max_sub_task_count_(private_nh_.param("max_sub_task_count", 3)) ///< 单轮任务中成功子任务数量上限
-        , planning_strategy_(private_nh_.param("planning_strategy", std::string("nearest_first"))) ///< 规划策略
+        , max_retry_count_(private_nh_.param("max_retry_count", 2))       ///< 单个目标最大重试次数
+        , planning_strategy_(private_nh_.param("planning_strategy", std::string("nearest_first"))) ///< 目标选择策略
         , loop_rate_(private_nh_.param("loop_rate", 10.0))                ///< 主循环频率（Hz）
         // ROS 订阅者
         , info_sub_(public_nh_.subscribe(
               private_nh_.param("info_topic", std::string("/ctrl/info")), 5,
-              &TaskPlanningNode::infoCallback, this))   ///< 机器人状态信息订阅者
+              &TaskPlanningNode::infoCallback, this))   ///< 机器人模式触发
         , detection_sub_(public_nh_.subscribe(
               private_nh_.param("detection_topic", std::string("/object_detection/detected_objects")), 5,
-              &TaskPlanningNode::detectionCallback, this))   ///< 检测结果订阅者
-        , sub_task_result_sub_(public_nh_.subscribe(
-              private_nh_.param("sub_task_result_topic", std::string("/motion_control/sub_task_result")), 5,
-              &TaskPlanningNode::subTaskResultCallback, this))   ///< 子任务执行结果订阅者
+              &TaskPlanningNode::detectionCallback, this))   ///< 3D 检测结果
+        , grasp_result_sub_(public_nh_.subscribe(
+              private_nh_.param("grasp_result_topic", std::string("/motion_control/grasp_result")), 5,
+              &TaskPlanningNode::graspResultCallback, this))   ///< 抓取执行反馈
         // ROS 发布者
-        , task_pub_(public_nh_.advertise<task_planning::Task>(
-              private_nh_.param("task_topic", std::string("/task_planning/task")), 1))   ///< 任务指令发布者
-        , sub_task_pub_(public_nh_.advertise<task_planning::SubTask>(
-              private_nh_.param("sub_task_topic", std::string("/task_planning/sub_task")), 1)) { ///< 子任务指令发布者
-        ROS_INFO("TaskPlanningNode initialized. Strategy: %s, Max sub-tasks: %d, Rate: %.1f Hz",
-                 planning_strategy_.c_str(), max_sub_task_count_, loop_rate_);
+        , phase_result_pub_(public_nh_.advertise<task_planning::PhaseResult>(
+              private_nh_.param("phase_result_topic", std::string("/task_planning/phase_result")), 1)) ///< 阶段完成报告
+        , grasp_command_pub_(public_nh_.advertise<task_planning::GraspCommand>(
+              private_nh_.param("grasp_command_topic", std::string("/task_planning/grasp_command")), 1)) { ///< 抓取指令
+        ROS_INFO("TaskPlanningNode initialized. Strategy: %s, Max retries: %d, Rate: %.1f Hz",
+                 planning_strategy_.c_str(), max_retry_count_, loop_rate_);
     }
 
     /**
@@ -67,8 +75,8 @@ public:
                 case PLANNING:
                     handlePlanning();
                     break;
-                case WAITING_RESULT:
-                    handleWaitingResult();
+                case WAITING:
+                    handleWaiting();
                     break;
                 case FIN:
                     handleFin();
@@ -86,12 +94,12 @@ private:
     /**
      * @brief 状态枚举
      *
-     * IDLE：准备阶段，等待触发信号
-     * PLANNING：规划阶段，订阅检测结果并发布子任务
-     * WAITING_RESULT：等待子任务执行结果
-     * FIN：结束阶段，发布任务完成信息
+     * IDLE：     准备阶段，等待 TASK_SCHEDULE 触发信号
+     * PLANNING： 规划阶段，选择目标并发布 GraspCommand
+     * WAITING：  等待抓取结果，失败时重试
+     * FIN：      结束阶段，发布 PhaseResult 并重置
      */
-    enum State { IDLE, PLANNING, WAITING_RESULT, FIN };
+    enum State { IDLE, PLANNING, WAITING, FIN };
 
     // ROS 节点句柄
     ros::NodeHandle private_nh_;
@@ -101,38 +109,45 @@ private:
     ros::Rate rate_;
 
     // 配置参数
-    const int max_sub_task_count_;               ///< 单轮任务中成功子任务数量上限
-    const std::string planning_strategy_;        ///< 规划策略
-    const double loop_rate_;                     ///< 主循环频率（Hz）
+    const int max_retry_count_;               ///< 单个抓取目标的最大重试次数
+    const std::string planning_strategy_;      ///< 目标选择策略
+    const double loop_rate_;                   ///< 主循环频率（Hz）
 
     // ROS 订阅者
-    ros::Subscriber info_sub_;            ///< 机器人状态信息订阅者
-    ros::Subscriber detection_sub_;       ///< 检测结果订阅者
-    ros::Subscriber sub_task_result_sub_; ///< 子任务执行结果订阅者
+    ros::Subscriber info_sub_;            ///< 机器人模式触发
+    ros::Subscriber detection_sub_;       ///< 3D 检测结果
+    ros::Subscriber grasp_result_sub_;    ///< 抓取执行反馈
 
     // ROS 发布者
-    ros::Publisher task_pub_;    ///< 任务指令发布者
-    ros::Publisher sub_task_pub_; ///< 子任务指令发布者
+    ros::Publisher phase_result_pub_;     ///< 阶段完成报告
+    ros::Publisher grasp_command_pub_;    ///< 抓取指令（发给 motion_control）
 
     // 当前状态
     State state_ = IDLE;
 
-    // 任务相关索引
-    int task_index_ = 0;     ///< 当前任务编号
-    int sub_task_index_ = 0; ///< 下一个待发布子任务的编号
+    // 轮次与指令跟踪
+    int round_index_ = 0;          ///< 当前轮次编号（每次 resetState 后递增）
+    int grasp_command_index_ = 0;  ///< 本轮内下一个抓取指令编号
+    int current_retry_count_ = 0;  ///< 当前目标的重试计数
 
-    // 子任务执行结果记录
-    std::vector<int32_t> sub_task_indices_completed_; ///< 成功完成的子任务编号列表
-    std::vector<int32_t> sub_task_indices_failed_;    ///< 执行失败的子任务编号列表
+    // 结果跟踪
+    std::vector<int32_t> grasp_indices_completed_; ///< 成功完成的 grasp_command_index 列表
+    std::vector<int32_t> grasp_indices_failed_;    ///< 执行失败的 grasp_command_index 列表
+    std::set<int32_t> failed_track_ids_;           ///< 重试耗尽的 track_id 集合
 
-    // 数据接收标志与缓存
+    // 当前抓取目标
+    object_detection::DetectionObject current_target_; ///< 正在尝试抓取的目标物体
+    bool has_current_target_ = false;                  ///< 是否持有当前目标
+
+    // 检测结果缓存
     bool got_detection_ = false;
-    object_detection::DetectionObjects::ConstPtr latest_detection_; ///< 最新检测结果
+    object_detection::DetectionObjects::ConstPtr latest_detection_; ///< 最新检测结果快照
 
+    // 抓取结果缓存
     bool got_result_ = false;
-    motion_control::SubTaskResult::ConstPtr latest_result_; ///< 最新子任务执行结果
+    task_planning::GraspResult::ConstPtr latest_result_; ///< 最新抓取结果
 
-    bool triggered_ = false; ///< 是否收到任务触发信号
+    bool triggered_ = false; ///< 是否收到 TASK_SCHEDULE 触发信号
 
     /**
      * @brief 检测结果回调函数
@@ -144,19 +159,20 @@ private:
     }
 
     /**
-     * @brief 子任务执行结果回调函数
-     * @param msg 子任务执行结果
+     * @brief 抓取结果回调函数
+     * @param msg 抓取执行结果
      */
-    void subTaskResultCallback(const motion_control::SubTaskResult::ConstPtr &msg) {
+    void graspResultCallback(const task_planning::GraspResult::ConstPtr &msg) {
         latest_result_ = msg;
         got_result_ = true;
     }
 
     /**
      * @brief 机器人状态信息回调函数
-     * @param msg 机器人状态信息
+     * @param msg 机器人模式信息
      *
-     * 当机器人处于 TASK_SCHEDULE 模式时，若当前为 IDLE 状态，则触发任务规划。
+     * 当机器人处于 TASK_SCHEDULE 模式且当前为 IDLE 状态时，
+     * 设置 triggered_ 标志以进入 PLANNING 状态。
      */
     void infoCallback(const robot_core::Info::ConstPtr &msg) {
         if (msg->mode == robot_core::Info::TASK_SCHEDULE) {
@@ -182,9 +198,10 @@ private:
     /**
      * @brief PLANNING 状态处理函数
      *
-     * 1. 等待一次检测结果；
+     * 1. 等待检测结果；
      * 2. 若场景中无物体，进入 FIN 状态；
-     * 3. 否则按策略选择目标物体，发布 SubTask，进入 WAITING_RESULT 状态。
+     * 3. 若所有物体均已失败，进入 FIN 状态；
+     * 4. 否则按策略选择目标物体，发布 GraspCommand，进入 WAITING 状态。
      */
     void handlePlanning() {
         if (!got_detection_ || !latest_detection_) {
@@ -200,100 +217,118 @@ private:
             return;
         }
 
-        // 按规划策略选择目标物体
-        const auto &obj = selectTargetObject(latest_detection_);
+        // 按规划策略选择目标物体（跳过已失败的 track_id）
+        const auto *target = selectTargetObject(latest_detection_);
+        if (target == nullptr) {
+            ROS_WARN("PLANNING: No valid target (all failed). Going to FIN.");
+            got_detection_ = false;
+            state_ = FIN;
+            return;
+        }
 
-        // 构造并发布子任务
-        task_planning::SubTask sub_task;
-        sub_task.target_class_id = obj.class_id;
-        sub_task.target_pose = obj.pose;
-        sub_task.sub_task_index = sub_task_index_;
+        current_target_ = *target;
+        has_current_target_ = true;
+        current_retry_count_ = 0;
 
-        sub_task_pub_.publish(sub_task);
-        ROS_INFO("Published SubTask: class_id=%d, index=%d",
-                 sub_task.target_class_id, sub_task.sub_task_index);
+        publishGraspCommand();
 
-        sub_task_index_++;
         got_detection_ = false;
-        state_ = WAITING_RESULT;
+        state_ = WAITING;
+        ROS_INFO("State: PLANNING -> WAITING (grasp_command_index=%d)", grasp_command_index_);
     }
 
     /**
-     * @brief WAITING_RESULT 状态处理函数
+     * @brief WAITING 状态处理函数
      *
-     * 等待子任务执行结果回执：
-     * - 成功：记录到完成列表；若成功数量达到上限则进入 FIN，否则回到 PLANNING 继续规划下一个子任务。
-     * - 失败：记录到失败列表，跳过当前任务，回到 PLANNING 继续规划下一个子任务。
+     * 等待抓取执行结果：
+     * - 成功：记录到完成列表，进入 FIN 状态；
+     * - 失败：重试计数递增；
+     *   - 若 retry < max：重发同一 GraspCommand，保持在 WAITING。
+     *   - 若 retry >= max：记录到失败列表，标记 track_id，回到 PLANNING。
      */
-    void handleWaitingResult() {
+    void handleWaiting() {
         if (!got_result_ || !latest_result_) {
-            ROS_INFO_THROTTLE(5.0, "WAITING_RESULT: Waiting for sub-task result...");
+            ROS_INFO_THROTTLE(5.0, "WAITING: Waiting for grasp result...");
             return;
         }
 
         got_result_ = false;
 
-        if (latest_result_->result == motion_control::SubTaskResult::SUCCESS) {
-            sub_task_indices_completed_.push_back(latest_result_->task_index);
-            ROS_INFO("SubTask %d succeeded", latest_result_->task_index);
+        if (latest_result_->result == task_planning::GraspResult::SUCCESS) {
+            grasp_indices_completed_.push_back(latest_result_->grasp_command_index);
+            ROS_INFO("GraspCommand %d succeeded", latest_result_->grasp_command_index);
 
-            // 成功子任务数量达到上限，结束本轮任务
-            if (static_cast<int>(sub_task_indices_completed_.size()) >= max_sub_task_count_) {
-                ROS_INFO("Reached max sub-task count (%d). Going to FIN.", max_sub_task_count_);
-                got_detection_ = false;
-                state_ = FIN;
+            grasp_command_index_++;
+            has_current_target_ = false;
+            state_ = FIN;
+            ROS_INFO("State: WAITING -> FIN");
+        } else {
+            current_retry_count_++;
+            ROS_ERROR("GraspCommand %d failed (retry %d/%d)",
+                      latest_result_->grasp_command_index, current_retry_count_, max_retry_count_);
+
+            if (current_retry_count_ < max_retry_count_) {
+                // 重试同一目标
+                publishGraspCommand();
+                ROS_INFO("Retrying GraspCommand %d", grasp_command_index_);
             } else {
+                // 重试耗尽，标记为失败
+                grasp_indices_failed_.push_back(latest_result_->grasp_command_index);
+                failed_track_ids_.insert(current_target_.track_id);
+                ROS_WARN("GraspCommand %d exhausted retries. Marking track_id=%d as failed.",
+                         latest_result_->grasp_command_index, current_target_.track_id);
+
+                grasp_command_index_++;
+                has_current_target_ = false;
                 state_ = PLANNING;
             }
-        } else {
-            sub_task_indices_failed_.push_back(latest_result_->task_index);
-            ROS_ERROR("SubTask %d failed. Skipping to next.", latest_result_->task_index);
-            state_ = PLANNING;
         }
     }
 
     /**
      * @brief FIN 状态处理函数
      *
-     * 再次订阅一次检测结果，判断任务是否真正结束：
-     * - 若场景中无剩余物体，发布 is_finish=true 的 Task 消息，进入 IDLE。
-     * - 若场景中仍有物体，发布 is_finish=false 的 Task 消息，进入 IDLE 等待下一轮触发。
+     * 构造并发布 PhaseResult 消息（phase_type=GRASP），
+     * 包含轮次编号、成功与失败的指令编号列表，然后重置状态回到 IDLE。
      */
     void handleFin() {
-        if (!got_detection_ || !latest_detection_) {
-            ROS_INFO_THROTTLE(5.0, "FIN: Waiting for detection data...");
-            return;
-        }
+        task_planning::PhaseResult phase_result;
+        phase_result.phase_type = task_planning::PhaseResult::GRASP;
+        phase_result.round_index = round_index_;
+        phase_result.indices_completed = grasp_indices_completed_;
+        phase_result.indices_failed = grasp_indices_failed_;
 
-        // 构造并发布任务指令
-        task_planning::Task task;
-        task.task_index = task_index_;
-        task.sub_task_count = static_cast<int32_t>(sub_task_indices_completed_.size() + sub_task_indices_failed_.size());
-        task.sub_task_indices_completed = sub_task_indices_completed_;
-        task.sub_task_indices_failed = sub_task_indices_failed_;
+        phase_result_pub_.publish(phase_result);
 
-        if (latest_detection_->objects.empty()) {
-            task.is_finish = true;
-            ROS_INFO("No objects remaining. Task finished (is_finish=true).");
-        } else {
-            task.is_finish = false;
-            ROS_INFO("Objects still remaining. Task cycle done but more work to do (is_finish=false).");
-        }
-
-        task_pub_.publish(task);
-        ROS_INFO("Published Task: task_index=%d, sub_task_count=%d, completed=%d, failed=%d, is_finish=%s",
-                 task.task_index, task.sub_task_count,
-                 static_cast<int>(sub_task_indices_completed_.size()),
-                 static_cast<int>(sub_task_indices_failed_.size()),
-                 task.is_finish ? "true" : "false");
-
+        ROS_INFO("Published PhaseResult: phase=GRASP, round=%d, completed=%d, failed=%d",
+                 phase_result.round_index,
+                 static_cast<int>(phase_result.indices_completed.size()),
+                 static_cast<int>(phase_result.indices_failed.size()));
+        ROS_INFO("State: FIN -> IDLE");   
         resetState();
     }
 
     /**
-     * @brief 重置任务状态与计数器
+     * @brief 发布当前目标的 GraspCommand
      *
-     * 回到 IDLE，清空本轮任务数据，任务编号递增，准备下一轮任务规划。
+     * 构造 GraspCommand 消息，填入当前目标的 class_id、track_id 和指令编号。
+     * motion_control 通过 track_id 从 detection 话题获取位姿。
+     */
+    void publishGraspCommand() {
+        task_planning::GraspCommand cmd;
+        cmd.target_class_id = current_target_.class_id;
+        cmd.target_track_id = current_target_.track_id;
+        cmd.grasp_command_index = grasp_command_index_;
+        grasp_command_pub_.publish(cmd);
+        ROS_INFO("Published GraspCommand: class_id=%d, track_id=%d, index=%d",
+                 cmd.target_class_id, cmd.target_track_id, cmd.grasp_command_index);
+    }
+
+    /**
+     * @brief 重置状态与计数器
+     *
+     * 清空本轮任务数据，重置所有索引和标志，
+     * 轮次编号递增，回到 IDLE 准备下一轮任务规划。
      */
     void resetState() {
         state_ = IDLE;
@@ -302,10 +337,13 @@ private:
         got_result_ = false;
         latest_detection_ = nullptr;
         latest_result_ = nullptr;
-        sub_task_index_ = 0;
-        sub_task_indices_completed_.clear();
-        sub_task_indices_failed_.clear();
-        task_index_++;
+        grasp_command_index_ = 0;
+        current_retry_count_ = 0;
+        has_current_target_ = false;
+        grasp_indices_completed_.clear();
+        grasp_indices_failed_.clear();
+        failed_track_ids_.clear();
+        round_index_++;
     }
 
     /**
@@ -323,25 +361,39 @@ private:
     /**
      * @brief 根据规划策略从检测结果中选择目标物体
      * @param detection 检测结果
-     * @return 被选中的目标物体
+     * @return 被选中的目标物体指针，无有效候选时返回 nullptr
      *
+     * 过滤掉 failed_track_ids_ 中的物体：
      * - nearest_first：选择距离原点最近的物体。
-     * - 其他策略：当前默认返回第一个检测到的物体，可后续扩展。
+     * - 其他策略
      */
-    object_detection::DetectionObject selectTargetObject(const object_detection::DetectionObjects::ConstPtr &detection) {
+    const object_detection::DetectionObject *selectTargetObject(
+        const object_detection::DetectionObjects::ConstPtr &detection) {
+
+        std::vector<const object_detection::DetectionObject *> candidates;
+        for (const auto &obj : detection->objects) {
+            if (failed_track_ids_.find(obj.track_id) == failed_track_ids_.end()) {
+                candidates.push_back(&obj);
+            }
+        }
+
+        if (candidates.empty()) {
+            return nullptr;
+        }
+
         if (planning_strategy_ == "nearest_first") {
             double min_distance = 10.0;
-            object_detection::DetectionObject nearest_obj;
-            for (const auto &obj : detection->objects) {
-                double distance = calculateDistance(obj.pose);
+            const object_detection::DetectionObject *nearest = nullptr;
+            for (const auto *obj : candidates) {
+                double distance = calculateDistance(obj->pose);
                 if (distance < min_distance) {
                     min_distance = distance;
-                    nearest_obj = obj;
+                    nearest = obj;
                 }
             }
-            return nearest_obj;
+            return nearest;
         } else {
-            return detection->objects.front();
+            return candidates.front();
         }
     }
 };

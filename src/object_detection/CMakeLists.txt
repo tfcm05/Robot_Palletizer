@@ -3,16 +3,17 @@ project(object_detection)
 
 find_package(catkin REQUIRED COMPONENTS
 	cv_bridge
-	tf
+	tf2_ros
+	tf2_geometry_msgs
 	roscpp
-	rospy
 	std_msgs
 	sensor_msgs
-  	geometry_msgs
-  	message_generation
+   	geometry_msgs
+   	message_generation
 	message_filters
-  	pcl_ros
-  	pcl_conversions
+   	pcl_ros
+   	pcl_conversions
+	detector
 )
 
 find_package(OpenCV REQUIRED)
@@ -35,9 +36,9 @@ generate_messages(
 catkin_package(
 	CATKIN_DEPENDS
 	cv_bridge
-	tf
+	tf2_ros
+	tf2_geometry_msgs
 	roscpp
-	rospy
 	std_msgs
     sensor_msgs
     geometry_msgs
@@ -45,6 +46,7 @@ catkin_package(
 	message_filters
     pcl_ros
     pcl_conversions
+	detector
 )
 
 include_directories(
@@ -59,6 +61,7 @@ add_executable(object_detection_node
 
 add_dependencies(object_detection_node
 	${${PROJECT_NAME}_EXPORTED_TARGETS}
+	detector_generate_messages_cpp
 	${catkin_EXPORTED_TARGETS}
 )
 

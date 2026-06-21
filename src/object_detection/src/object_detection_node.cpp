@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -7,7 +8,8 @@
 
 #include <cv_bridge/cv_bridge.h>
 #include <detector/BoundingBoxes.h>
-#include <tf/transform_listener.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 
 #include <ros/ros.h>
 
@@ -44,8 +46,9 @@ public:
         // ROS 节点句柄
         : global_nh_()  ///< 全局节点句柄，用于订阅外部话题
         , private_nh_("~")  ///< 私有节点句柄，用于读取参数和发布话题
-        // TF 监听器
-        , tf_listener_(ros::Duration(private_nh_.param("tf_cache_time", 10.0)))  ///< TF 变换监听器，缓存时间 10 秒
+        // TF2 缓冲区与监听器
+        , tf_buffer_(ros::Duration(private_nh_.param("tf_cache_time", 10.0)))  ///< TF2 变换缓冲区，缓存时间 10 秒
+        , tf_listener_(tf_buffer_)  ///< TF2 变换监听器
         // 消息过滤器订阅者
         , bbox_sub_(global_nh_, private_nh_.param("bbox_topic", std::string("/detector/bounding_boxes")), 5)  ///< 边界框订阅者
         , depth_sub_(global_nh_, private_nh_.param("depth_topic", std::string("/kinect2/qhd/image_depth_rect")), 5)  ///< 深度图订阅者
@@ -57,13 +60,12 @@ public:
               private_nh_.param("object_detection_topic", std::string("/object_detection/detected_objects")), 1))  ///< 检测结果发布者
         // 深度处理参数
         , min_depth_(private_nh_.param("min_depth", 0.1))  ///< 有效最小深度（米）
-        , max_depth_(private_nh_.param("max_depth", 6.0))  ///< 有效最大深度（米）
-        , depth_tolerance_(private_nh_.param("depth_tolerance", 0.05))  ///< 前景过滤深度容差（米）
-        // 类别修正参数
-        , confidence_threshold_(private_nh_.param("confidence_threshold", 0.8))  ///< 置信度阈值，低于此值使用点云形状修正类别
-        , large_object_diagonal_threshold_(private_nh_.param("large_object_diagonal_threshold", 0.18))  ///< 大物体对角线阈值（米）
-        , min_points_for_shape_(private_nh_.param("min_points_for_shape", 30))  ///< 用于形状分析的最少点数
-        // 其他参数
+        , max_depth_(private_nh_.param("max_depth", 5.0))  ///< 有效最大深度（米）
+        , depth_tolerance_(private_nh_.param("depth_tolerance", 0.08))  ///< 深度一致性容差（米）
+        , center_sample_ratio_(private_nh_.param("center_sample_ratio", 0.2))  ///< 中心采样窗口比例
+        // 尺寸推断参数
+        , size_confidence_threshold_(private_nh_.param("size_confidence_threshold", 0.6))  ///< 尺寸推断的置信度阈值，低于此值不信任 class_id 改用点云 extent 推断
+        // 输出参数
         , pose_frame_(private_nh_.param("pose_frame", std::string("base_link")))  ///< 目标输出坐标系
         , publish_point_cloud_(private_nh_.param("publish_point_cloud", false)) {  ///< 是否在检测结果中附带点云
         // 设置同步器最大时间间隔
@@ -117,13 +119,18 @@ private:
         for (std::size_t bbox_index = 0; bbox_index < bbox_msg->bounding_boxes.size(); ++bbox_index) {
             const auto &bounding_box = bbox_msg->bounding_boxes[bbox_index];
 
-            int x_min = bounding_box.x_min;
-            int y_min = bounding_box.y_min;
-            int x_max = bounding_box.x_max;
-            int y_max = bounding_box.y_max;
+            // 将边界框裁剪到深度图范围内，防止 ROI 越界导致崩溃
+            int x_min = std::max(0, std::min(static_cast<int>(bounding_box.x_min), depth_image.cols - 1));
+            int y_min = std::max(0, std::min(static_cast<int>(bounding_box.y_min), depth_image.rows - 1));
+            int x_max = std::max(0, std::min(static_cast<int>(bounding_box.x_max), depth_image.cols - 1));
+            int y_max = std::max(0, std::min(static_cast<int>(bounding_box.y_max), depth_image.rows - 1));
+            if (x_max <= x_min || y_max <= y_min) {
+                continue;
+            }
 
             object_detection::DetectionObject detection_object;
             detection_object.class_id = static_cast<int32_t>(bounding_box.class_id);
+            detection_object.track_id = static_cast<int32_t>(bounding_box.track_id);
 
             // bbox 对应区域的点云生成
             pcl::PointCloud<pcl::PointXYZ> point_cloud;
@@ -134,22 +141,23 @@ private:
             cv::Mat range_mask;
             cv::inRange(depth_roi, static_cast<float>(min_depth_), static_cast<float>(max_depth_), range_mask);
 
-            // 创建前景掩码：只保留与 bbox 内最小深度相差 depth_tolerance_ 以内的像素，
-            // 用于剔除背景或远离前景目标的异常深度点
-            cv::Mat foreground_mask;
-            double min_depth_in_roi = 0.0;
-            double max_depth_in_roi = 0.0;
-            cv::Point min_loc;
-            cv::Point max_loc;
-            const cv::Mat roi_valid_mask = range_mask;
-            cv::minMaxLoc(depth_roi, &min_depth_in_roi, &max_depth_in_roi, &min_loc, &max_loc, roi_valid_mask);
-            if (roi_valid_mask.empty() || cv::countNonZero(roi_valid_mask) == 0) {
-                // ROI 内没有有效深度，跳过该边界框
+            // 创建深度一致性掩码：基于 ROI 中心区域的中值深度，过滤与目标深度不一致的点
+            const int cw_x_min = static_cast<int>(roi_rect.width  * (1.0 - center_sample_ratio_) / 2.0);
+            const int cw_x_max = static_cast<int>(roi_rect.width  * (1.0 + center_sample_ratio_) / 2.0);
+            const int cw_y_min = static_cast<int>(roi_rect.height * (1.0 - center_sample_ratio_) / 2.0);
+            const int cw_y_max = static_cast<int>(roi_rect.height * (1.0 + center_sample_ratio_) / 2.0);
+            double center_depth;
+            sampleDepth(depth_roi, cw_x_min, cw_x_max, cw_y_min, cw_y_max, center_depth);
+            if (std::isnan(center_depth)) {
                 continue;
             }
-            cv::inRange(depth_roi, static_cast<float>(min_depth_in_roi), static_cast<float>(min_depth_in_roi + depth_tolerance_), foreground_mask);
 
-            // 将范围掩码与前景掩码进行按位与运算，得到最终的有效前景像素掩码
+            const float lo = static_cast<float>(center_depth - depth_tolerance_);
+            const float hi = static_cast<float>(center_depth + depth_tolerance_);
+            cv::Mat foreground_mask;
+            cv::inRange(depth_roi, lo, hi, foreground_mask);
+
+            // 将范围掩码与深度一致性掩码进行按位与运算，得到最终的有效像素掩码
             cv::Mat valid_mask;
             cv::bitwise_and(range_mask, foreground_mask, valid_mask);
 
@@ -182,24 +190,30 @@ private:
             }
 
             if (!point_cloud.empty()) {
-                // 如果检测框的置信度低于阈值，则使用点云形状进行类别修正
-                const bool low_confidence = static_cast<double>(bounding_box.confidence) < confidence_threshold_;
-                if (low_confidence) {
-                    const int refined_class_id = refineClassByPointCloudShape(
-                        point_cloud,
-                        static_cast<int>(bounding_box.class_id),
-                        large_object_diagonal_threshold_,
-                        min_points_for_shape_);
-                    detection_object.class_id = static_cast<int32_t>(refined_class_id);
-                    ROS_WARN_THROTTLE(
-                        5.0,
-                        "Low-confidence detection (conf=%.3f) refined by point cloud shape: class_id=%d",
-                        static_cast<double>(bounding_box.confidence),
-                        detection_object.class_id);
+                // PCA 分析：
+                Eigen::Matrix3f pca_eigenvectors;
+                bool pca_valid = false;
+                {
+                    pcl::PCA<pcl::PointXYZ> pca;
+                    pca.setInputCloud(point_cloud.makeShared());
+                    // getEigenVectors() 返回 3×3 矩阵，三列按特征值从大到小排列，
+                    pca_eigenvectors = pca.getEigenVectors();
+                    pca_valid = true;
+                }
+
+                // 低置信度时用点云 extent 修正 class_id（纠正尺寸位，保留颜色位）
+                int corrected_class_id = static_cast<int>(detection_object.class_id);
+                if (pca_valid && bounding_box.confidence < static_cast<float>(size_confidence_threshold_)) {
+                    corrected_class_id = correctClassId(corrected_class_id, point_cloud, pca_eigenvectors);
+                    detection_object.class_id = static_cast<int32_t>(corrected_class_id);
                 }
 
                 // 点云质心
-                Eigen::Vector4f centroid = computeObjectCentroid(point_cloud, static_cast<int>(detection_object.class_id));
+                Eigen::Vector4f centroid = computeObjectCentroid(
+                    point_cloud,
+                    corrected_class_id,
+                    pca_eigenvectors,
+                    pca_valid);
 
                 // 构造相机坐标系下的位姿
                 geometry_msgs::PoseStamped pose_cam;
@@ -214,12 +228,27 @@ private:
                 pose_cam.pose.orientation.y = 0.0;
                 pose_cam.pose.orientation.z = 0.0;
                 pose_cam.pose.orientation.w = 1.0;
+                if (pca_valid) {
+                    // 将 PCA 特征向量矩阵转为有效旋转矩阵：
+                    // PCA 得到的三个特征向量两两正交，但可能为左手系（行列式 < 0），
+                    // 而四元数/旋转矩阵要求右手系，因此翻转第三列使其行列式为正。
+                    if (pca_eigenvectors.determinant() < 0) {
+                        pca_eigenvectors.col(2) = -pca_eigenvectors.col(2);
+                    }
+                    // 构造四元数：旋转矩阵的列即为物体三个主轴在相机坐标系下的方向。
+                    Eigen::Quaternionf q(pca_eigenvectors);
+                    q.normalize();
+                    pose_cam.pose.orientation.x = q.x();
+                    pose_cam.pose.orientation.y = q.y();
+                    pose_cam.pose.orientation.z = q.z();
+                    pose_cam.pose.orientation.w = q.w();
+                }
 
                 // 尝试将位姿从相机坐标系转换到目标坐标系，如果转换失败则使用相机坐标系下的位姿
                 try {
-                    tf_listener_.transformPose(pose_frame_, pose_cam, pose_obj);
+                    tf_buffer_.transform(pose_cam, pose_obj, pose_frame_);
                     detection_object.pose = pose_obj;
-                } catch (const tf::TransformException &ex) {
+                } catch (const tf2::TransformException &ex) {
                     ROS_WARN_THROTTLE(5.0, "TF transform to %s failed: %s", pose_frame_.c_str(), ex.what());
                     detection_object.pose = pose_cam;
                 }
@@ -277,82 +306,189 @@ private:
     }
 
     /**
-     * @brief 根据点云形状修正物体类别
-     * @param point_cloud 物体点云
-     * @param original_class_id 原始类别 ID
-     * @param large_object_diagonal_threshold 大物体对角线阈值（米）
-     * @param min_points_for_shape 形状分析所需最少点数
-     * @return 修正后的类别 ID
-     *
-     * 通过点云包围盒对角线长度判断物体大小，进而修正类别。
+     * @brief 对深度图中指定矩形区域采样，返回有效深度的中值
+     * @param depth_image 深度图像（CV_32FC1，NaN 表示无效）
+     * @param x_min 采样区域左边界（列索引，含）
+     * @param x_max 采样区域右边界（列索引，不含）
+     * @param y_min 采样区域上边界（行索引，含）
+     * @param y_max 采样区域下边界（行索引，不含）
+     * @param out_depth 输出：中值深度（米），无效时返回 NaN
      */
-    int refineClassByPointCloudShape(
-        const pcl::PointCloud<pcl::PointXYZ> &point_cloud,
-        int original_class_id,
-        double large_object_diagonal_threshold,
-        std::size_t min_points_for_shape) {
-        if (point_cloud.size() < min_points_for_shape) {
-            return original_class_id;
+    void sampleDepth(
+        const cv::Mat &depth_image,
+        int x_min, int x_max, int y_min, int y_max,
+        double &out_depth) {
+
+        // 使用 thread_local 局部缓存：每个线程独立持有自己的副本，
+        thread_local std::vector<float> depth_samples_buffer;
+
+        // 清空采样缓存，并预分配容量避免循环中频繁扩容
+        depth_samples_buffer.clear();
+        depth_samples_buffer.reserve(static_cast<std::size_t>((x_max - x_min) * (y_max - y_min)));
+
+        // 遍历采样区域，收集所有有限且在有效深度范围内的像素值
+        for (int row = y_min; row < y_max; ++row) {
+            const float *row_ptr = depth_image.ptr<float>(row);
+            for (int col = x_min; col < x_max; ++col) {
+                const float depth = row_ptr[col];
+                if (std::isfinite(depth) && depth >= min_depth_ && depth <= max_depth_) {
+                    depth_samples_buffer.push_back(depth);
+                }
+            }
         }
 
-        pcl::PointXYZ min_point;
-        pcl::PointXYZ max_point;
-        pcl::getMinMax3D(point_cloud, min_point, max_point);
+        std::vector<float> &valid = depth_samples_buffer;
 
-        const double dx = static_cast<double>(max_point.x - min_point.x);
-        const double dy = static_cast<double>(max_point.y - min_point.y);
-        const double dz = static_cast<double>(max_point.z - min_point.z);
-
-        // 通过计算点云包围盒的对角线长度来判断物体的大小，进而进行类别修正
-        const double diagonal = std::sqrt(dx * dx + dy * dy + dz * dz);
-        const bool is_large = diagonal >= large_object_diagonal_threshold;
-
-        int color_group_base = -1;
-        if (original_class_id == 0 || original_class_id == 1) {
-            color_group_base = 0;
-        } else if (original_class_id == 2 || original_class_id == 3) {
-            color_group_base = 2;
+        // 无有效采样值时返回 NaN
+        if (valid.empty()) {
+            out_depth = std::numeric_limits<double>::quiet_NaN();
+            return;
         }
 
-        if (color_group_base < 0) {
-            return original_class_id;
+        // 用 nth_element 部分排序取中值，避免对整个序列完全排序
+        const std::size_t middle = valid.size() / 2;
+        std::nth_element(valid.begin(), valid.begin() + middle, valid.end());
+        if ((valid.size() % 2) == 0) {
+            // 偶数个样本：取中间两个的平均作为中值
+            const float upper = valid[middle];
+            std::nth_element(valid.begin(), valid.begin() + middle - 1, valid.begin() + middle);
+            const float lower = valid[middle - 1];
+            out_depth = (static_cast<double>(lower) + static_cast<double>(upper)) / 2.0;
+        } else {
+            // 奇数个样本：直接取中间元素
+            out_depth = static_cast<double>(valid[middle]);
+        }
+    }
+
+    /**
+     * @brief 修正检测器输出的 class_id
+     * @param class_id 检测器给出的类别 ID
+     * @param cloud 物体点云
+     * @param eigenvectors PCA 主方向（3×3 旋转矩阵，各列为特征向量）
+     * @return 修正后的 class_id
+     *
+     * 将点云投影到三个 PCA 主方向上计算可见范围，取两个较大的面内 extent 推断真实尺寸
+     * 调用方根据置信度决定是否调用本函数。
+     */
+    int correctClassId(
+        int class_id,
+        const pcl::PointCloud<pcl::PointXYZ>& cloud,
+        const Eigen::Matrix3f& eigenvectors) {
+
+        // 以点云质心作为投影原点
+        Eigen::Vector4f centroid;
+        pcl::compute3DCentroid(cloud, centroid);
+        Eigen::Vector3f mean3(centroid[0], centroid[1], centroid[2]);
+
+        // 计算点云在三个主方向上的可见范围
+        std::array<float, 3> extents{};
+        for (int comp = 0; comp < 3; ++comp) {
+            Eigen::Vector3f axis = eigenvectors.col(comp);
+            float min_proj = std::numeric_limits<float>::max();
+            float max_proj = -std::numeric_limits<float>::max();
+            for (std::size_t i = 0; i < cloud.size(); ++i) {
+                Eigen::Vector3f p(cloud[i].x - mean3[0],
+                                  cloud[i].y - mean3[1],
+                                  cloud[i].z - mean3[2]);
+                float proj = p.dot(axis);
+                if (proj < min_proj) min_proj = proj;
+                if (proj > max_proj) max_proj = proj;
+            }
+            extents[comp] = max_proj - min_proj;
         }
 
-        return color_group_base + (is_large ? 0 : 1);
+        // 取两个较大的面内 extent 推断真实尺寸
+        std::array<float, 3> sorted_extent = extents;
+        std::sort(sorted_extent.begin(), sorted_extent.end());
+        const float face_extent = std::max(sorted_extent[1], sorted_extent[2]);
+        const bool extent_is_large = (face_extent > 0.12f);
+        const bool class_is_large = ((class_id % 2) == 0);
+
+        // extent 与 class_id 一致，无需修正
+        if (extent_is_large == class_is_large) {
+            return class_id;
+        }
+
+        return class_id ^ 1;
     }
 
     /**
      * @brief 计算物体点云的质心
      * @param cloud 物体点云
-     * @param class_id 物体类别 ID
-     * @return 质心坐标（齐次坐标形式）
+     * @param class_id 物体类别 ID（已修正，用于推断边长）
+     * @param eigenvectors PCA 主方向（3×3 旋转矩阵，各列为特征向量）
+     * @param pca_valid PCA 是否有效
+     * @return 质心坐标
      *
-     * 对立方体类物体，在质心基础上沿 z 轴偏移半个点云深度。
+     * 使用 PCA 主方向与点云可见范围对质心进行校正，估计立方体几何中心：
+     * 1) 由已修正的 class_id 推断边长 L
+     * 2) 将点投影到每个主方向上，得到该方向的可见范围 [min_proj, max_proj] 和 extent
+     * 3) 若某方向 extent 接近真实边长（> 0.7×L），说明该方向能看到完整尺寸，用中点作为中心
+     * 4) 若 extent 明显小于真实边长，说明只看到该方向的一个面，用 L/2 从可见表面
+     *    向远离相机的一侧偏移，以估计立方体几何中心
      */
     Eigen::Vector4f computeObjectCentroid(
         const pcl::PointCloud<pcl::PointXYZ>& cloud,
-        int class_id) {
+        int class_id,
+        const Eigen::Matrix3f& eigenvectors,
+        bool pca_valid) {
 
         Eigen::Vector4f centroid;
         pcl::compute3DCentroid(cloud, centroid);
 
-        // 根据物体类型决定是否需要深度偏移
-        switch (class_id) {
-            case 0:
-            case 1:
-            case 2:
-            case 3:
-                // 立方体物体
-                {
-                    pcl::PointXYZ min_pt, max_pt;
-                    pcl::getMinMax3D(cloud, min_pt, max_pt);
-                    double dz = max_pt.z - min_pt.z;
-                    centroid[2] += dz / 2.0;  // 偏移半个深度
+        if (!pca_valid) {
+            return centroid;
+        }
+
+        // 由已修正的 class_id 推断边长 L
+        double L = (class_id == 1 || class_id == 3) ? 0.10 : 0.15;
+        float Lf = static_cast<float>(L);
+
+        // 以原始质心作为 PCA 投影的原点
+        Eigen::Vector3f mean3(centroid[0], centroid[1], centroid[2]);
+
+        for (int comp = 0; comp < 3; ++comp) {
+            // 当前主方向（单位向量）
+            Eigen::Vector3f axis = eigenvectors.col(comp);
+            float min_proj = std::numeric_limits<float>::max();
+            float max_proj = -std::numeric_limits<float>::max();
+
+            // 将所有点投影到当前主方向上，记录最大/最小投影
+            for (std::size_t i = 0; i < cloud.size(); ++i) {
+                Eigen::Vector3f p(cloud[i].x - mean3[0],
+                                  cloud[i].y - mean3[1],
+                                  cloud[i].z - mean3[2]);
+                float proj = p.dot(axis);
+                if (proj < min_proj) min_proj = proj;
+                if (proj > max_proj) max_proj = proj;
+            }
+
+            const float extent = max_proj - min_proj;
+            if (extent > Lf * 0.7f) {
+                // 该方向能看到完整尺寸 → 直接用中点作为该维度的中心
+                const float mid_proj = (min_proj + max_proj) / 2.0f;
+                centroid[0] += mid_proj * axis[0];
+                centroid[1] += mid_proj * axis[1];
+                centroid[2] += mid_proj * axis[2];
+            } else {
+                // 该方向只看到单个面，无法从点云得到完整尺寸
+                // 因此根据已知边长 L 将质心从可见表面向物体内部偏移 L/2
+                // 偏移方向应远离相机：取与相机→物体方向夹角为锐角的方向
+                Eigen::Vector3f dir_to_obj(mean3[0], mean3[1], mean3[2]);
+                const float norm = dir_to_obj.norm();
+                if (norm > 1e-6f) {
+                    dir_to_obj /= norm;
+                    if (axis.dot(dir_to_obj) < 0.0f) {
+                        axis = -axis;
+                    }
+                } else if (axis[2] < 0.0f) {
+                    // 若质心在原点附近（异常），则默认让主轴 z 分量为正，指向远离相机方向
+                    axis = -axis;
                 }
-                break;
-            default:
-                // 默认不偏移
-                break;
+                centroid[0] += (Lf / 2.0f) * axis[0];
+                centroid[1] += (Lf / 2.0f) * axis[1];
+                centroid[2] += (Lf / 2.0f) * axis[2];
+            }
         }
 
         return centroid;
@@ -372,8 +508,9 @@ private:
     ros::NodeHandle global_nh_;
     ros::NodeHandle private_nh_;
 
-    // TF 监听器
-    tf::TransformListener tf_listener_;
+    // TF2 缓冲区与监听器
+    tf2_ros::Buffer tf_buffer_;                 ///< TF2 变换缓冲区
+    tf2_ros::TransformListener tf_listener_;    ///< TF2 变换监听器
 
     // 消息过滤器订阅者
     message_filters::Subscriber<detector::BoundingBoxes> bbox_sub_;        ///< 边界框订阅者
@@ -389,14 +526,13 @@ private:
     // 深度处理参数
     const double min_depth_;  ///< 有效最小深度（米）
     const double max_depth_;  ///< 有效最大深度（米）
-    const double depth_tolerance_;  ///< 前景过滤深度容差（米）
+    const double depth_tolerance_;  ///< 深度一致性容差（米）
+    const double center_sample_ratio_;  ///< 中心采样窗口比例
+    
+    // 尺寸推断参数
+    const double size_confidence_threshold_;  ///< 尺寸推断的置信度阈值，低于此值不信任 class_id
 
-    // 类别修正参数
-    const double confidence_threshold_;           ///< 置信度阈值
-    const double large_object_diagonal_threshold_; ///< 大物体对角线阈值（米）
-    const int min_points_for_shape_;              ///< 形状分析所需最少点数
-
-    // 其他参数
+    // 输出参数
     const std::string pose_frame_;        ///< 目标输出坐标系
     const bool publish_point_cloud_;      ///< 是否在检测结果中附带点云
 };

@@ -9,6 +9,7 @@ class Detection:
     bbox: Tuple[int, int, int, int]
     confidence: float
     class_id: int
+    track_id: int = -1
 
 
 class BaseDetector(ABC):

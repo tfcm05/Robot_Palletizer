@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="2">
   <name>task_planning</name>
-  <version>0.0.1</version>
+  <version>0.0.2</version>
   <description>Task planning module between object_detection and motion_control</description>
 
   <maintainer email="23371480@buaa.edu.cn">xizheTang</maintainer>

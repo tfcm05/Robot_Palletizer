@@ -1,0 +1,46 @@
+<launch>
+
+  <arg name="gui" default="true" doc="Launch Gazebo GUI (gzclient)"/>
+  <arg name="paused" default="false" doc="Start Gazebo paused"/>
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(find robot_sim_test)/worlds/wpb_simple.world"/>
+    <arg name="paused" value="$(arg paused)"/>
+    <arg name="gui" value="$(arg gui)"/>
+  </include>
+
+  <!-- Robot Description (URDF) -->
+  <arg name="model" default="$(find robot_sim_test)/models/wpb_home.model"/>
+  <param name="robot_description" command="$(find xacro)/xacro $(arg model)"/>
+  <node name="joint_state_publisher" pkg="joint_state_publisher" type="joint_state_publisher"/>
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"/>
+
+  <!-- Spawn robot into Gazebo -->
+  <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model"
+    args="-file $(arg model) -urdf -model wpb_home"
+    output="screen"/>
+    
+  <!-- Spawn cubes into Gazebo -->
+  <node name="red_cube_big" pkg="gazebo_ros" type="spawn_model"
+    args="-file $(find robot_sim_test)/models/cubes/red_cube_big.model -x 2.0 -y -0.6 -z 0 -urdf -model red_cube_big"
+    output="screen"/>
+  <node name="red_cube_small" pkg="gazebo_ros" type="spawn_model"
+    args="-file $(find robot_sim_test)/models/cubes/red_cube_small.model -x 2.0 -y 0.6 -z 0 -urdf -model red_cube_small"
+    output="screen"/>
+  <node name="green_cube_big" pkg="gazebo_ros" type="spawn_model"
+    args="-file $(find robot_sim_test)/models/cubes/green_cube_big.model -x 3.0 -y -0.3 -z 0 -urdf -model green_cube_big"
+    output="screen"/>
+  <node name="green_cube_small" pkg="gazebo_ros" type="spawn_model"
+    args="-file $(find robot_sim_test)/models/cubes/green_cube_small.model -x 3.0 -y 0.3 -z 0 -urdf -model green_cube_small"
+    output="screen"/>
+
+  <!-- Detector node (2D detection / tracking) -->
+  <node name="detector" pkg="detector" type="detector_node.py" output="screen">
+    <rosparam command="load" file="$(find robot_sim_test)/config/detector_config.yaml"/>
+  </node>
+
+  <!-- Object detection node (3D pose estimation from bbox + depth + camera_info) -->
+  <node name="object_detection" pkg="object_detection" type="object_detection_node" output="screen">
+    <rosparam command="load" file="$(find robot_sim_test)/config/object_detection_config.yaml"/>
+  </node>
+</launch>
